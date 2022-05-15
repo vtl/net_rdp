@@ -1,0 +1,50 @@
+#!/bin/bash
+
+CCPU=1
+SCPU=16
+
+RING_SIZE=8192
+
+function normal_setup {
+    echo
+}
+
+function normal_cleanup {
+    echo
+}
+
+function reorder_setup {
+    sudo tc qdisc add dev lo root netem delay 1ms reorder 25% 50%
+}
+
+function reorder_cleanup {
+    sudo tc qdisc del dev lo root netem delay 1ms reorder 25% 50%
+}
+
+function drop_setup {
+    sudo tc qdisc add dev lo root netem loss 1%
+}
+
+function drop_cleanup {
+    sudo tc qdisc del dev lo root netem loss 1%
+}
+
+normal_cleanup
+reorder_cleanup
+drop_cleanup
+
+rm -f results*.txt
+for test in normal reorder drop; do
+    ${test}_setup
+    for bs in 512 2048 8192 16384; do
+        for proto in tcp rdp; do
+            file=results-$test-$proto-r$RING_SIZE-b$bs-32.txt
+            taskset -c $SCPU ./$proto 127.0.0.1 0 $RING_SIZE $bs 32 &
+            sleep 1
+            taskset -c $CCPU ./$proto 127.0.0.1 1 $RING_SIZE $bs 32 | tee $file
+            killall $proto
+            grep RET= $file | cut -c 5-
+        done
+    done
+    ${test}_cleanup
+done
