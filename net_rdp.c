@@ -18,11 +18,9 @@ int ring_size;
 int pkt_size;
 int ack_batch_size;
 
-#define VERBOSE 1
+#define VERBOSE 0
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
-
-#define ATLEAST(a, b) ((a) < (b) ? (b) : (a))
 
 /* rdtsc */
 extern __inline unsigned long long
@@ -93,8 +91,8 @@ struct net_rdp_buffer {
 	struct net_rdp_hdr hdr;
 	int len;
 	struct msghdr msg;
-	struct net_rdp_stripe stripes[BUF_IOV]; // FIXME
-	struct iovec iov[BUF_IOV]; // FIXME
+	struct net_rdp_stripe stripes[BUF_IOV]; /* FIXME */
+	struct iovec iov[BUF_IOV];              /* FIXME */
 };
 
 struct net_rdp_state {
@@ -103,11 +101,13 @@ struct net_rdp_state {
 					 * 0 - remote source (track randomly) */
 	int size;			/* max number of packets */
 	int mask;
+	uint32_t expt_size;
+	uint32_t expt_mask;
 	int nr_stripes;			/* size / bits in stripe->bits */
 	int stripe_size;
 	int stripe_mask;
 	int stripe_shift;
-	uint16_t gen_id;		/* upper bits of tail/head */
+	uint16_t gen_id;
 	int head;			/* head of the tracked pkts ring */
 	int tail;			/* tail of the tracker pkts ring */
 	int cnt;			/* number of tracked pkts */
@@ -115,8 +115,8 @@ struct net_rdp_state {
 	int watermark;			/* max packets to track */
 	int data_watermark;		/* max non-ACK pkts to track */
 	int ack_batch_size;		/* send ACK after that many recvs */
-	int expt_tail;			/* expected tail of rnd fill ring */
-	int expt_head;			/* expected head of rnd fill ring */
+	uint32_t expt_tail;		/* expected tail of rnd fill ring */
+	uint32_t expt_head;		/* expected head of rnd fill ring */
 	struct net_rdp_stripe *stripes;	/* tracked pkts */
 	struct net_rdp_stripe *seen;	/* Seen in this gen_id*/
 	struct net_rdp_stripe *tbs;	/* To Be Seen */
@@ -183,7 +183,7 @@ void net_rdp_stripe_print(char *msg, struct net_rdp_stripe *stripe)
 	int i;
 	uint64_t bits;
 
-	dprintf(0, "%s [%04d:%02d] ", msg, stripe->gen_id, stripe->idx);
+	dprintf(0, "%s [%05d:%02d] ", msg, stripe->gen_id, stripe->idx);
 	bits = stripe->bits;
 
 	for (i = 0; i < (int)(8 * sizeof(stripe->bits)); i++, bits >>= 1) {
@@ -233,7 +233,7 @@ void net_rdp_recalc_rtt(struct net_rdp_state *state)
 	uint64_t new_avg_rtt = 0;
 
 	/* recalc RTT */
-	// FIXME need it to be more robust, time-dependent
+	/* FIXME need it to be more robust, time-dependent */
 	for (i = n = 0; i < (int)ARRAY_SIZE(state->rtt); i++) {
 		if (state->rtt[i]) {
 			new_avg_rtt += state->rtt[i];
@@ -263,6 +263,8 @@ void net_rdp_state_init(struct net_rdp_state *state, int local, uint16_t cnt, in
 	state->local = local;
 	state->size = cnt;
 	state->mask = state->size - 1;
+	state->expt_size = state->size * (1UL << (8 * sizeof(state->gen_id)));
+	state->expt_mask = state->expt_size - 1;
 	state->stripe_size = stripe_size;
 	state->stripe_mask = state->stripe_size - 1;
 	state->stripe_shift = __builtin_ffs(state->stripe_size) - 1;
@@ -277,11 +279,10 @@ void net_rdp_state_init(struct net_rdp_state *state, int local, uint16_t cnt, in
 		abort();
 	state->watermark = watermark;
 	state->ack_batch_size = ack_batch_size;
-	/* FIXME
-	 * How much slots does it really need for ACKs?
-	 * An appropriate ACKs reserve is critical for the current
-	 * design (ACKs are separate packet flavor). This has to be
-	 * changed soon: ACKs will be embedded into DATA packets.
+	/* FIXME How many slots does it really need for ACKs?  An
+	 * appropriate ACK reserve is critical for the current design
+	 * (ACKs are a separate packet flavor). This has to be changed
+	 * soon: ACK will be embedded into DATA packets.
 	 */
 	state->data_watermark = state->watermark - (2 * state->watermark / state->ack_batch_size);
 	if (name)
@@ -300,23 +301,27 @@ void net_rdp_state_init(struct net_rdp_state *state, int local, uint16_t cnt, in
 	state->avg_rtt = 10000;
 	state->timeout_adds_rtt = 1;
 	net_rdp_state_print(state);
-	// state->cur_gen_id = random();
-	// FIXME randomize all indexes as well
+	/* state->cur_gen_id = random(); */
+	/* FIXME randomize all indexes as well */
 }
 
 int net_rdp_track_tbs(struct net_rdp_state *state, uint16_t pkt)
 {
 	int ret, stripe = 0;
 	int bit;
+	uint64_t old_bits;
 
 	dprintf(1, "> %s %p %s %d\n", __func__, (void *)state, state->name, pkt);
 
 	stripe = pkt >> state->stripe_shift;
 	bit = pkt & state->stripe_mask;
+	old_bits = state->tbs[stripe].bits;
+	/* check for dup */
+	assert((state->tbs[stripe].bits & (1UL << bit)) == 0);
 	state->tbs[stripe].bits |= 1UL << bit;
 	ret = pkt;
 
-	dprintf(-1, "< %s %p %s %d\n", __func__, (void *)state, state->name, ret);
+	dprintf(-1, "< %s %p %s %d 0x%lx -> 0x%lx\n", __func__, (void *)state, state->name, ret, old_bits, state->tbs[stripe].bits);
 	return ret;
 }
 
@@ -329,6 +334,8 @@ int net_rdp_track_seen(struct net_rdp_state *state, uint16_t pkt)
 
 	stripe = pkt >> state->stripe_shift;
 	bit = pkt & state->stripe_mask;
+	/* check for dup */
+	assert((state->seen[stripe].bits & (1UL << bit)) == 0);
 	state->seen[stripe].bits |= 1UL << bit;
 	ret = pkt;
 
@@ -368,7 +375,7 @@ int net_rdp_track_sequential(struct net_rdp_state *state, int *stripep)
 	old_head = state->head;
 
 	state->head = (state->head + 1) & state->mask;
-	state->expt_head++; // FIXME handle wrap
+	state->expt_head = (state->expt_head + 1) & state->expt_mask;
 
 	if (old_head > state->head)
 		state->gen_id++;
@@ -390,10 +397,47 @@ out:
 	return ret;
 }
 
-int net_rdp_track_random(struct net_rdp_state *state, int gen_id, int id, int *stripep)
+int net_rdp_span(struct net_rdp_state *state, uint32_t head, uint32_t tail)
+{
+	dprintf(0, "%s:%d state %s, head %u, tail %u\n", __func__, __LINE__, state->name, head, tail);
+	if (head < tail)
+		head += state->expt_size;
+
+	dprintf(0, "%s:%d state %s, head %u, tail %u, span %u\n", __func__, __LINE__, state->name, head, tail, head - tail);
+	return head - tail;
+}
+
+int net_rdp_is_past(struct net_rdp_state *state, uint32_t id)
+{
+	/* Handle gen_id wrap. ID too much in past is not stale */
+	if (id + 0x100 * state->size < state->expt_tail)
+		return 0;
+
+	if (state->expt_head < state->expt_tail) {
+		return (id > state->expt_head) &&
+			(id < state->expt_tail);
+	} else {
+		return id < state->expt_tail;
+	}
+}
+
+int net_rdp_is_future(struct net_rdp_state *state, uint32_t id, uint32_t head)
+{
+	if (head < state->expt_tail) {
+		return (id < state->expt_tail) &&
+			(id > head);
+	} else {
+		if ((id < (uint32_t)state->size) &&
+		    ((state->expt_size - head) < (uint32_t)state->size))
+			id += state->expt_size;
+		return id > head;
+	}
+}
+
+int net_rdp_track_random(struct net_rdp_state *state, uint16_t gen_id, int id, int *stripep)
 {
 	int ret, stripe = 0, bit;
-	int ext_id;
+	uint32_t ext_id;
 
 	dprintf(1, "> %s %p %s gen_id %d, id %d\n", __func__, (void *)state, state->name, gen_id, id);
 
@@ -405,14 +449,14 @@ int net_rdp_track_random(struct net_rdp_state *state, int gen_id, int id, int *s
 
 	ext_id = gen_id * state->size + id;
 
-	if (ext_id < state->expt_tail) {
+	if (net_rdp_is_past(state, ext_id)) {
 		dprintf(0, "       !!!!!! gen_id %d id %d is from past\n", gen_id, id);
 		state->drop_past++;
 		ret = -EINVAL;
 		goto out;
 	}
 
-	if (ext_id > state->expt_head + state->watermark + 1) {
+	if (net_rdp_is_future(state, ext_id, (state->expt_head + state->watermark + 1) % state->expt_mask)) {
 		dprintf(0, "       !!!!!! gen_id %d id %d is too far in future\n", gen_id, id);
 		state->drop_future++;
 		ret = -EINVAL;
@@ -429,6 +473,7 @@ int net_rdp_track_random(struct net_rdp_state *state, int gen_id, int id, int *s
 	bit    = id & state->stripe_mask;
 
 	if (state->seen[stripe].bits & (1UL << bit)) {
+		dprintf(0, "       !!!!!! gen_id %d id %d is dup (has been seen)\n", gen_id, id);
 		state->drop_dup++;
 		ret = -EEXIST;
 		goto out;
@@ -438,15 +483,16 @@ int net_rdp_track_random(struct net_rdp_state *state, int gen_id, int id, int *s
 
 	state->cnt++;
 
-	if (ext_id >= state->expt_head) {
+	if (net_rdp_is_future(state, (ext_id + 1) & state->expt_mask, state->expt_head)) {
 		int old_head;
 
-		state->expt_head = ext_id + 1; // FIXME handle wrap
-		state->span = state->expt_head - state->expt_tail;
 		old_head = state->head;
 		state->head = (id + 1) & state->mask;
 		if (state->head < old_head)
 			state->gen_id++;
+
+		state->expt_head = (ext_id + 1) & state->expt_mask;
+		state->span = net_rdp_span(state, state->expt_head, state->expt_tail);
 	}
 
 	state->modified_stripes[stripe]++;
@@ -461,16 +507,16 @@ out:
 
 int net_rdp_track(struct net_rdp_state *state, int gen_id, int id, int *stripep)
 {
-	int ret, old_expt_head, i = -1;
+	int ret, i = -1;
+	int old_head, h;
 
-	old_expt_head = state->expt_head;
+	old_head = state->head;
 
 	net_rdp_state_print(state);
 
 	if (state->local) {
 		assert(id == NET_RDP_CURRENT_GEN_ID);
 		ret = id = net_rdp_track_sequential(state, &i);
-		gen_id = state->gen_id;
 	} else {
 		ret = net_rdp_track_random(state, gen_id, id, &i);
 	}
@@ -483,8 +529,8 @@ int net_rdp_track(struct net_rdp_state *state, int gen_id, int id, int *stripep)
 	if (!state->local)
 		net_rdp_track_seen(state, id);
 
-	for (i = old_expt_head; i < state->expt_head; i++)
-		net_rdp_track_tbs(state, i & state->mask);
+	for (h = old_head; h != state->head; h = (h + 1) & state->mask)
+		net_rdp_track_tbs(state, h);
 
 	if (id == state->tail)
 		state->tail_time_submitted = state->buffers[state->tail].submitted;
@@ -497,12 +543,14 @@ out:
 void net_rdp_untrack_tbs(struct net_rdp_state *state, uint16_t id)
 {
 	int i, bit;
+	uint64_t old_bits;
 
 	dprintf(1, "> %s %p %s %d\n", __func__, (void *)state, state->name, id);
 	i   = id >> state->stripe_shift;
 	bit = id & state->stripe_mask;
+	old_bits = state->tbs[i].bits;
 	state->tbs[i].bits &= ~(1UL << bit);
-	dprintf(-1, "< %s %p %s %d\n", __func__, (void *)state, state->name, id);
+	dprintf(-1, "< %s %p %s %d, 0x%lx -> 0x%lx\n", __func__, (void *)state, state->name, id, old_bits, state->tbs[i].bits);
 }
 
 int net_rdp_untrack(struct net_rdp_state *state, uint16_t id)
@@ -511,7 +559,7 @@ int net_rdp_untrack(struct net_rdp_state *state, uint16_t id)
 	int i, bit;
 	int ret;
 	uint64_t bits, pos;
-	int ext_id;
+	uint32_t ext_id;
 
 	dprintf(1, "> %s %p %s %d\n", __func__, (void *)state, state->name, id);
 
@@ -524,11 +572,11 @@ int net_rdp_untrack(struct net_rdp_state *state, uint16_t id)
 	}
 	pos = 1UL << bit;
 	stripe = &state->stripes[i];
-	bits = stripe->bits;
-	stripe->bits &= ~pos;
 
-	/* can't untrack what's been not tracked */
-	assert(bits != stripe->bits);
+	/* can't untrack what's not been tracked */
+	assert(stripe->bits & pos);
+
+	stripe->bits &= ~pos;
 
 	ext_id = stripe->gen_id * state->size + id;
 
@@ -538,6 +586,7 @@ int net_rdp_untrack(struct net_rdp_state *state, uint16_t id)
 		state->buffers[id].submitted = 0;
 	}
 
+	assert(state->cnt);
 	state->cnt--;
 
 	net_rdp_untrack_tbs(state, id);
@@ -552,25 +601,23 @@ int net_rdp_untrack(struct net_rdp_state *state, uint16_t id)
 			if (bits & (1UL << bit))
 				break;
 
-			state->expt_tail++;
+			state->expt_tail = (state->expt_tail + 1) & state->expt_mask;
 			state->tail = (state->tail + 1) & state->mask;
 			bit++;
 			if (bit == state->stripe_size) {
 				state->stripes[i].gen_id++;
 				/* make sure SEEN can be cleared */
-				// FIXME why stripes? tbs?
 				assert(!state->stripes[i].bits);
 				state->seen[i].bits = 0;
 				i = (i + 1) % state->nr_stripes;
 				bit = 0;
 				bits = state->tbs[i].bits;
 			}
-		} while (state->expt_tail < state->expt_head);
-
+		} while (state->expt_tail != state->expt_head);
 		dprintf(0, "new tail %d, expt_tail %d, expt_head %d\n", state->tail, state->expt_tail, state->expt_head);
 	}
 
-	state->span = state->expt_head - state->expt_tail;
+	state->span = net_rdp_span(state, state->expt_head, state->expt_tail);
 	assert(state->cnt <= state->span);
 
 	if (id == state->tail)
@@ -635,8 +682,12 @@ int net_rdp_state_collect_lost_buffers(struct net_rdp_state *state, struct net_r
 			timeout += 10000 * VERBOSE;
 
 			if (diff > timeout) {
-				dprintf(0, "[%d] now %lu, pkt %lu, diff %lu, timeout %lu, avg_rtt %lu\n", pkt, now, state->buffers[pkt].submitted, diff, timeout, (uint64_t)state->avg_rtt);
-				dprintf(0, "lost pkt ext_id %d id %d, gen_id %d\n", buf->hdr.gen_id * state->size + pkt, pkt, buf->hdr.gen_id);
+				dprintf(0, "[%d] now %lu, pkt %lu, diff %lu, timeout %lu, avg_rtt %lu\n",
+					pkt, now, state->buffers[pkt].submitted,
+					diff, timeout, (uint64_t)state->avg_rtt);
+				dprintf(0, "lost pkt ext_id %d id %d, gen_id %d\n",
+					buf->hdr.gen_id * state->size + pkt, pkt,
+					buf->hdr.gen_id);
 				if (lost_cnt < max_cnt) {
 					lost[lost_cnt++] = pkt;
 				}
@@ -664,7 +715,7 @@ int net_rdp_state_collect_lost(struct net_rdp_state *state, int *lost, int max_c
 {
 	int ret = 0;
 
-//	dprintf(1, "> %s %p\n", __func__, state);
+	/* dprintf(1, "> %s %p\n", __func__, state); */
 
 	if (!state->cnt)
 		goto out;
@@ -672,7 +723,7 @@ int net_rdp_state_collect_lost(struct net_rdp_state *state, int *lost, int max_c
 	ret = net_rdp_state_collect_lost_buffers(state, state->buffers, lost, max_cnt);
 
 out:
-//	dprintf(-1, "< %s %d\n", __func__, ret);
+	/* dprintf(-1, "< %s %d\n", __func__, ret); */
 	return ret;
 }
 
@@ -709,8 +760,8 @@ void net_rdp_retransmit_lost(struct net_rdp_socket *sock)
 		ret = net_sendmsg(sock->fd, &buf->msg, MSG_DONTWAIT);
 		if (ret == buf->len) {
 			buf->submitted = now;
-			//		if (buf->hdr.id == state->tail)
-			//	state->tail_time_submitted = buf->submitted;
+			/* if (buf->hdr.id == state->tail) */
+			/* 	state->tail_time_submitted = buf->submitted; */
 		} else {
 			dprintf(0, "%s sendmsg ret=%d %d (%s)\n", __func__, ret, errno, strerror(errno));
 		}
@@ -755,7 +806,7 @@ void net_rdp_state_uninit(struct net_rdp_state *state)
 
 void net_rdp_socket_init(struct net_rdp_socket *sock)
 {
-	// FIXME shut the timer
+	/* FIXME shut the timer */
 
 	net_rdp_state_uninit(&sock->recv_state);
 	net_rdp_state_uninit(&sock->sent_state);
@@ -841,7 +892,7 @@ void net_rdp_socket_peer_send_init(struct net_rdp_socket *sock)
 	struct net_rdp_buffer buf;
 	int i, ret;
 
-	// FIXME send ring/ack params
+	/* FIXME negotiate ring/ack params */
 	memset(&buf, 0, sizeof(buf));
 	net_rdp_buffer_init(sock, &buf);
 	buf.hdr.type = NET_RDP_INIT;
@@ -867,7 +918,7 @@ int net_rdp_socket_send_ack(struct net_rdp_socket *sock)
 
 	dprintf(1, "> %s sock %p\n", __func__, (void *)sock);
 
-	// FIXME start from tail
+	/* FIXME start from tail */
 	for (i = j = 0; (j < (BUF_IOV - 1)) && (i < sock->recv_state.nr_stripes); i++) {
 		if (sock->recv_state.modified_stripes[i]) {
 			net_rdp_stripe_print(sock->recv_state.name, &sock->recv_state.stripes[i]);
@@ -939,7 +990,7 @@ void net_rdp_process_ack(struct net_rdp_state *state, char *buf, int len, struct
 		int idx, pkt;
 		uint64_t bits;
 		int j;
-//		__verbose++;
+		/* __verbose++; */
 		rem_stripe = &stripes[i];
 		net_rdp_stripe_print("rem", rem_stripe);
 		idx = rem_stripe->idx;
@@ -974,7 +1025,7 @@ void net_rdp_process_ack(struct net_rdp_state *state, char *buf, int len, struct
 
 		net_rdp_stripe_print("mod", loc_stripe);
 		dprintf(0, "\n");
-//		__verbose--;
+		/* __verbose--; */
 	}
 	net_rdp_recalc_rtt(state);
 	net_rdp_state_print(state);
@@ -991,7 +1042,7 @@ int net_rdp_socket_recv(struct net_rdp_socket *sock, void *_buf, int _len)
 	char *p;
 	char buf[8192];
 
-//	dprintf(1, "> %s\n", __func__);
+	/* dprintf(1, "> %s\n", __func__); */
 
 	ret = recvfrom(sock->fd, buf, sizeof(buf), MSG_DONTWAIT, (struct sockaddr *)&peer, &peer_len);
 	if (ret < 0) {
@@ -1046,7 +1097,7 @@ int net_rdp_socket_recv(struct net_rdp_socket *sock, void *_buf, int _len)
 	ret = len;
 
 out:
-//	dprintf(-1, "< %s ret %d\n", __func__, ret);
+	/* dprintf(-1, "< %s ret %d\n", __func__, ret); */
 
 	return ret;
 }
@@ -1084,9 +1135,9 @@ int net_rdp_socket_send_iov(struct net_rdp_socket *sock, int type, struct iovec 
 	int tracker_idx;
 	int i;
 
-//	dprintf(1, "> %s %p %d\n", __func__, iov_, iov_len);
+	/* dprintf(1, "> %s %p %d\n", __func__, iov_, iov_len); */
 
-	/* reserve at least 8 slots for ACKs */
+	/* reserve slots for ACKs */
 	if ((type != NET_RDP_ACK) &&
 	    ((sock->sent_state.span >= (sock->sent_state.data_watermark)) ||
 	     (sock->sent_state.cnt >= (sock->sent_state.data_watermark)))) {
@@ -1112,7 +1163,7 @@ int net_rdp_socket_send_iov(struct net_rdp_socket *sock, int type, struct iovec 
 	buf->hdr.gen_id = sock->sent_state.stripes[stripe].gen_id;
 	buf->hdr.id = tracker_idx;
 	buf->hdr.recv_tail = sock->recv_state.tail;
-/* FIXME multiple hdrs in pkt */
+	/* FIXME multiple hdrs in pkt */
 	buf->hdr.type = type;
 	buf->len = buf->iov[0].iov_len;
 
@@ -1145,7 +1196,8 @@ int net_rdp_socket_send_iov(struct net_rdp_socket *sock, int type, struct iovec 
 	if (idp)
 		*idp = tracker_idx;
 out:
-//	dprintf(-1, "< %s %d written %d bytes\n", __func__, ret, total_len);
+	/* dprintf(-1, "< %s %d written %d bytes\n", __func__, ret, total_len); */
+
 	/* FIXME need to send ack along the way. Or embed it in
 	 * NET_RDP_DATA packet, otherwise recv_state watermark stall
 	 * happens */
@@ -1273,8 +1325,12 @@ int main(int argc, char *argv[])
 		if ((end - start) > 1e6) {
 			diff = end - start;
 			pkts = 1e6 * n / diff;
-			printf("%d pkt/s\n", pkts);
-
+			printf("%d pkt/s, rxmt:%lu ovhd:%3.2f rgenid:%u sgenid:%u sack:%lu rack:%lu p/a: %3.2f "
+			       "st:%lu rtt:%lu\n",
+			       pkts, sock.rexmit_cnt, sock.rexmit_cnt * 100.0 / i,
+			       sock.recv_state.gen_id, sock.sent_state.gen_id,
+			       sock.sent_acks_cnt, sock.recv_acks_cnt, (double)i / sock.recv_acks_cnt,
+			       sock.sent_state.stalls, sock.sent_state.avg_rtt);
 			start = end;
 			n = 0;
 		}
