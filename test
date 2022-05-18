@@ -37,7 +37,7 @@ rm -f results*.txt
 for test in normal reorder drop; do
     ${test}_setup
     for bs in 512 2048 8192 16384; do
-        for proto in tcp rdp; do
+        for proto in tcp net_rdp; do
             file=results-$test-$proto-r$RING_SIZE-b$bs-32.txt
             taskset -c $SCPU ./$proto 127.0.0.1 0 $RING_SIZE $bs 32 &
             sleep 1
