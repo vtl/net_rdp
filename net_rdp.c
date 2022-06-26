@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 199309L
+#define _XOPEN_SOURCE 500
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
@@ -157,6 +158,7 @@ enum {
 };
 
 struct net_rdp_socket {
+	uint16_t tag;
 	int fd;
 	uint32_t dst;
 	int port;
@@ -804,9 +806,16 @@ void net_rdp_state_uninit(struct net_rdp_state *state)
 	free(state->modified_stripes);
 }
 
-void net_rdp_socket_init(struct net_rdp_socket *sock)
+void net_rdp_socket_init(struct net_rdp_socket *sock, uint16_t tag)
 {
 	/* FIXME shut the timer */
+
+	if ((sock->tag == tag) && sock->tag)
+		return;
+
+	printf("reinit with tag %x (was %x)\n", tag, sock->tag);
+
+	sock->tag = tag;
 
 	net_rdp_state_uninit(&sock->recv_state);
 	net_rdp_state_uninit(&sock->sent_state);
@@ -844,7 +853,7 @@ int net_rdp_socket_open(struct net_rdp_socket *sock, unsigned int dst, int port)
 		goto out_socket;
 	}
 
-	net_rdp_socket_init(sock);
+	net_rdp_socket_init(sock, 0);
 
 	sa.sa_flags = SA_SIGINFO;
 	sa.sa_sigaction = net_rdp_timer_handler;
@@ -896,6 +905,8 @@ void net_rdp_socket_peer_send_init(struct net_rdp_socket *sock)
 	memset(&buf, 0, sizeof(buf));
 	net_rdp_buffer_init(sock, &buf);
 	buf.hdr.type = NET_RDP_INIT;
+	buf.hdr.id = random();
+	printf("send reinit request with tag %x\n", buf.hdr.id);
 
 	for (i = 0; i < 3; i++) {
 		ret = net_sendmsg(sock->fd, &buf.msg, 0);
@@ -1065,8 +1076,7 @@ int net_rdp_socket_recv(struct net_rdp_socket *sock, void *_buf, int _len)
 	dprintf(0, "recv hdr: gen_id %d id %d type %d\n", hdr->gen_id, hdr->id, hdr->type);
 
 	if (hdr->type == NET_RDP_INIT) {
-		printf("got reinit request\n");
-		net_rdp_socket_init(sock);
+		net_rdp_socket_init(sock, hdr->id);
 		ret = 0;
 		goto out;
 	}
