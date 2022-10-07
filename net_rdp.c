@@ -15,10 +15,6 @@
 #include <time.h>
 #include <unistd.h>
 
-int ring_size;
-int pkt_size;
-int ack_batch_size;
-
 #define VERBOSE 0
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -79,8 +75,8 @@ struct net_rdp_hdr {
 	uint16_t gen_id;
 	uint16_t id;
 	uint8_t type;
-	uint16_t recv_tail;
 	uint8_t stripe_cnt;
+	uint16_t recv_tail;
 };
 
 #define BUF_IOV 64
@@ -249,7 +245,8 @@ void net_rdp_recalc_rtt(struct net_rdp_state *state)
 }
 
 
-void net_rdp_state_init(struct net_rdp_state *state, int local, uint16_t cnt, int watermark, char *name)
+void net_rdp_state_init(struct net_rdp_state *state, int local, uint16_t cnt,
+			uint8_t ack_batch_size, int watermark, char *name)
 {
 	int i;
 	int stripes;
@@ -806,25 +803,28 @@ void net_rdp_state_uninit(struct net_rdp_state *state)
 	free(state->modified_stripes);
 }
 
-void net_rdp_socket_init(struct net_rdp_socket *sock, uint16_t tag)
+void net_rdp_socket_init(struct net_rdp_socket *sock, uint16_t tag,
+			 uint16_t ring_size, uint8_t ack_batch_size)
 {
 	/* FIXME shut the timer */
 
 	if ((sock->tag == tag) && sock->tag)
 		return;
 
-	printf("reinit with tag %x (was %x)\n", tag, sock->tag);
+	printf("reinit with tag %x (was %x), ring_size %d, ack_batch_size %d\n",
+	       tag, sock->tag, ring_size, ack_batch_size);
 
 	sock->tag = tag;
 
 	net_rdp_state_uninit(&sock->recv_state);
 	net_rdp_state_uninit(&sock->sent_state);
 
-	net_rdp_state_init(&sock->recv_state, 0, ring_size, ring_size / 2, "recv");
-	net_rdp_state_init(&sock->sent_state, 1, ring_size, ring_size / 2, "sent");
+	net_rdp_state_init(&sock->recv_state, 0, ring_size, ack_batch_size, ring_size / 2, "recv");
+	net_rdp_state_init(&sock->sent_state, 1, ring_size, ack_batch_size, ring_size / 2, "sent");
 }
 
-int net_rdp_socket_open(struct net_rdp_socket *sock, unsigned int dst, int port)
+int net_rdp_socket_open(struct net_rdp_socket *sock, unsigned int dst, int port,
+			uint16_t ring_size, uint8_t ack_batch_size)
 {
 	int ret;
 	struct sockaddr_in addr;
@@ -853,7 +853,7 @@ int net_rdp_socket_open(struct net_rdp_socket *sock, unsigned int dst, int port)
 		goto out_socket;
 	}
 
-	net_rdp_socket_init(sock, 0);
+	net_rdp_socket_init(sock, 0, ring_size, ack_batch_size);
 
 	sa.sa_flags = SA_SIGINFO;
 	sa.sa_sigaction = net_rdp_timer_handler;
@@ -906,7 +906,11 @@ void net_rdp_socket_peer_send_init(struct net_rdp_socket *sock)
 	net_rdp_buffer_init(sock, &buf);
 	buf.hdr.type = NET_RDP_INIT;
 	buf.hdr.id = random();
-	printf("send reinit request with tag %x\n", buf.hdr.id);
+	buf.hdr.stripe_cnt = sock->sent_state.ack_batch_size;
+	buf.hdr.recv_tail = sock->sent_state.size;
+
+	printf("send reinit request with tag %x, ring size %d, ack_batch_size %d\n",
+	       buf.hdr.id, buf.hdr.recv_tail, buf.hdr.stripe_cnt);
 
 	for (i = 0; i < 3; i++) {
 		ret = net_sendmsg(sock->fd, &buf.msg, 0);
@@ -1076,7 +1080,7 @@ int net_rdp_socket_recv(struct net_rdp_socket *sock, void *_buf, int _len)
 	dprintf(0, "recv hdr: gen_id %d id %d type %d\n", hdr->gen_id, hdr->id, hdr->type);
 
 	if (hdr->type == NET_RDP_INIT) {
-		net_rdp_socket_init(sock, hdr->id);
+		net_rdp_socket_init(sock, hdr->id, hdr->recv_tail, hdr->stripe_cnt);
 		ret = 0;
 		goto out;
 	}
@@ -1296,21 +1300,33 @@ int main(int argc, char *argv[])
 	int client;
 	uint64_t _start, start, end, n, diff;
 	int pkts;
+	int ring_size      = 128;
+	int pkt_size       = 512;
+	int ack_batch_size = 32;
 
-	if (argc < 6) {
-		printf("%s <ip addr> <0 - server, 1 - client> <ring size> <pkt size> <ack batch size>\n", argv[0]);
+	if (argc < 3) {
+		printf("%s <ip addr> <0 - server, 1 - client> [ring size] [ack batch size] [pkt size]\n", argv[0]);
 		return 1;
 	}
 	addr = inet_addr(argv[1]);
 	client = strtoul(argv[2], NULL, 10);
-	ring_size = strtoul(argv[3], NULL, 10);
-	pkt_size = strtoul(argv[4], NULL, 10);
-	ack_batch_size = strtoul(argv[5], NULL, 10);
+
+	printf("argc = %d\n", argc);
+	switch (argc) {
+	case 6:	pkt_size = strtoul(argv[5], NULL, 10); /* fall through */
+	case 5: ack_batch_size = strtoul(argv[4], NULL, 10); /* fall through */
+	case 4: ring_size = strtoul(argv[3], NULL, 10); /* fall through */
+		break;
+	default:
+		break;
+	}
 
 	printf("I'm %s, sock %p, remote addr %x %s\n", client ? "client" : "server", (void *)&sock, addr, argv[1]);
 	printf("ring size %d, pkt size %d, ack batch size %d\n", ring_size, pkt_size, ack_batch_size);
 
-	ret = net_rdp_socket_open(&sock, addr, client);
+	srandom(time(NULL));
+
+	ret = net_rdp_socket_open(&sock, addr, client, ring_size, ack_batch_size);
 
 	if (!client)
 		goto server;
