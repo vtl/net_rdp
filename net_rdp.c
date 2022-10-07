@@ -291,7 +291,8 @@ void net_rdp_state_init(struct net_rdp_state *state, int local, uint16_t cnt,
 	 * (ACKs are a separate packet flavor). This has to be changed
 	 * soon: ACK will be embedded into DATA packets.
 	 */
-	state->data_watermark = state->watermark - (2 * state->watermark / state->ack_batch_size);
+//	state->data_watermark = state->watermark - (2 * state->watermark / state->ack_batch_size);
+	state->data_watermark = state->watermark * 3 / 4;
 	if (name)
 		strncpy(state->name, name, sizeof(state->name) - 1);
 	else
