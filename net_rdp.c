@@ -945,8 +945,13 @@ int net_rdp_socket_send_ack(struct net_rdp_socket *sock)
 		}
 	}
 
-	if (!j)
+	if (!j) {
+		dprintf(0, "recv has nothing to ack:\n");
+		__dprintf_n++;
+		net_rdp_state_print(&sock->recv_state);
+		__dprintf_n--;
 		goto out;
+	}
 
 	dprintf(0, "was mod %d, modified stipes cnt: %d\n", sock->recv_state.was_modified, j);
 	ret = net_rdp_socket_send_iov(sock, NET_RDP_ACK, (struct iovec *)&iov, j, -1, &id);
@@ -1241,23 +1246,42 @@ int net_rdp_socket_drive_state(struct net_rdp_socket *sock)
 	/* RX - send ACKs for received packets */
 
 	/* more than 8 packets */
-	if (sock->recv_state.cnt >= sock->recv_state.ack_batch_size ||
+	if (sock->recv_state.cnt >= sock->recv_state.ack_batch_size) {
+		dprintf(0, "send ack because recv_state.cnt (%d) >= recv_state.ack_batch_size (%d)\n",
+			sock->recv_state.cnt, sock->recv_state.ack_batch_size);
+		goto send_ack;
+	}
+
 	    /* or more than 8 processed acks (could come in 1 packet) */
-	    sock->recv_state.processed_ack_cnt >= (uint64_t)sock->recv_state.ack_batch_size ||
+	if (sock->recv_state.processed_ack_cnt >= (uint64_t)sock->recv_state.ack_batch_size) {
+		dprintf(0, "send ack because recv_state.processed_ack_cnt (%ld) >= recv_state.ack_batch_size (%d)\n",
+			sock->recv_state.processed_ack_cnt, sock->recv_state.ack_batch_size);
+		goto send_ack;
+	}
+
 	    /* or recveiver can't track more packets */
-	    sock->recv_state.stalled ||
-	    /* send any ACKs we can */
-	    sock->sent_state.stalled ||
+	if (sock->recv_state.stalled) {
+		dprintf(0, "send ack because recv_state.stalled (%d)\n", sock->recv_state.stalled);
+		goto send_ack;
+	}
+
+	/* send any ACKs we can */
+	if (sock->sent_state.stalled) {
+		dprintf(0, "send ack because sent_state.stalled (%d)\n", sock->sent_state.stalled);
+		goto send_ack;
+	}
+
 	    /* or every second */
-	    sock->keep_alive_tick) {
-		dprintf(0, "send ack because sent queued ack pkts %d, recv cnt %d, recv span %d, sent processed_ack_cnt %lu\n",
-			sock->sent_state.queued_ack_pkts,
-			sock->recv_state.cnt,
-			sock->recv_state.span,
-			sock->recv_state.processed_ack_cnt);
-		if (net_rdp_socket_send_ack(sock)) {
-			sock->recv_state.processed_ack_cnt = 0;
-		}
+	if (sock->keep_alive_tick) {
+		dprintf(0, "send ack, because keep_alive_tick (%d)\n", sock->keep_alive_tick);
+		goto send_ack;
+	}
+
+	return 0;
+
+send_ack:
+	if (net_rdp_socket_send_ack(sock)) {
+		sock->recv_state.processed_ack_cnt = 0;
 	}
 
 	sock->keep_alive_tick = 0;
