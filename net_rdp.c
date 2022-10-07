@@ -17,6 +17,8 @@
 
 #define VERBOSE 0
 
+#define MAX_AVG_RTT 10000UL
+
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 /* rdtsc */
@@ -243,6 +245,10 @@ void net_rdp_recalc_rtt(struct net_rdp_state *state)
 	if (n)
 		new_avg_rtt /= n;
 	dprintf(0, "avg_rtt %lu -> %lu\n", state->avg_rtt, new_avg_rtt);
+	if (new_avg_rtt > MAX_AVG_RTT) {
+		dprintf(0, "avg_rtt %lu capped at %lu\n", new_avg_rtt, MAX_AVG_RTT);
+		new_avg_rtt = MAX_AVG_RTT;
+	}
 	state->avg_rtt = new_avg_rtt;
 }
 
