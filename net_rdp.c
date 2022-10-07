@@ -173,6 +173,8 @@ struct net_rdp_socket {
 
 #define UNUSED(x) (void)(x);
 
+int net_rdp_socket_drive_state(struct net_rdp_socket *sock);
+
 void net_rdp_stripe_print(char *msg, struct net_rdp_stripe *stripe)
 {
 	UNUSED(msg);
@@ -1091,6 +1093,12 @@ int net_rdp_socket_recv(struct net_rdp_socket *sock, void *_buf, int _len)
 	}
 
 	ret = net_rdp_track(&sock->recv_state, hdr->gen_id, hdr->id, &stripe);
+	if (ret < 0) {
+		/* no recv_state space? then send acks sooner and try again */
+		net_rdp_socket_drive_state(sock);
+		ret = net_rdp_track(&sock->recv_state, hdr->gen_id, hdr->id, &stripe);
+	}
+
 	if (ret < 0)
 		goto out;
 
