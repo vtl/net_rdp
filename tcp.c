@@ -56,14 +56,14 @@ int main(int argc, char *argv[])
 	uint64_t _start, start, end, n, diff, pkts;
 
 	if (argc < 6) {
-		printf("%s <ip addr> <0 - server, 1 - client> <ring size> <pkt size> <ack batch size>\n", argv[0]);
+		printf("%s <ip addr> <0 - server, 1 - client> <ring size> <ack batch size> <pkt size>\n", argv[0]);
 		return 1;
 	}
 	addr = inet_addr(argv[1]);
 	client = strtoul(argv[2], NULL, 10);
 	ring_size = strtoul(argv[3], NULL, 10);
-	pkt_size = strtoul(argv[4], NULL, 10);
-	ack_batch_size = strtoul(argv[5], NULL, 10);
+	ack_batch_size = strtoul(argv[4], NULL, 10);
+	pkt_size = strtoul(argv[5], NULL, 10);
 
 	printf("I'm %s, remote addr %x %s\n", client ? "client" : "server", addr, argv[1]);
 	printf("ring size %d, pkt size %d, ack batch size %d\n", ring_size, pkt_size, ack_batch_size);
@@ -170,6 +170,11 @@ restart:
 		goto out;
 	}
 	printf("accepted\n");
+
+	if (setsockopt(fd2, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof(int)) < 0) {
+		printf("setsockopt TCP_NODELAY %d (%s)\n", errno, strerror(errno));
+		goto out;
+	}
 
 	for (i = 1;; i++) {
 	again1:
